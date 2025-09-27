@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Online LM Studio Chat</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <style>
+        body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .chat-container { max-height: 70vh; overflow-y: auto; border: 1px solid #333; border-radius: 5px; padding: 10px; background-color: #252526; }
+        .message { margin-bottom: 10px; padding: 8px; border-radius: 5px; }
+        .user { background-color: #094771; text-align: right; }
+        .bot { background-color: #2d2d30; }
+        .sys { background-color: #3c3c3c; font-style: italic; }
+        .input-group { margin-top: 10px; }
+        .palette { position: absolute; background-color: #252526; border: 1px solid #333; max-height: 200px; overflow-y: auto; z-index: 1000; display: none; }
+        .palette-item { padding: 5px; cursor: pointer; }
+        .palette-item:hover { background-color: #094771; }
+    </style>
+</head>
+<body>
+    <div class="container mt-4">
+        <h1 class="text-center">Online LM Studio Chat</h1>
+        <div id="chat" class="chat-container"></div>
+        <div class="input-group">
+            <input type="text" id="input" class="form-control" placeholder="Type your message... (use / for commands)">
+            <button id="save-prompt" class="btn btn-secondary">Save Prompt</button>
+            <button id="manage-prompts" class="btn btn-info">Manage Prompts</button>
+            <button id="clear-chat" class="btn btn-warning">Clear Chat</button>
+            <button id="retry" class="btn btn-success">Retry</button>
+            <button id="send" class="btn btn-primary">Send</button>
+        </div>
+        <div id="palette" class="palette"></div>
+        <small class="text-muted">Ensure LM Studio is running locally. Type / to search prompts. Use buttons for save/manage.</small>
+
+        <!-- Manage Prompts Modal -->
+        <div class="modal fade" id="manageModal" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content" style="background-color: #1e1e1e; color: #d4d4d4;">
+                    <div class="modal-header">
+                        <h5 class="modal-title">Manage Prompts</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div id="prompt-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chat = document.getElementById('chat');
+        const input = document.getElementById('input');
+        const send = document.getElementById('send');
+        const savePromptBtn = document.getElementById('save-prompt');
+        const managePromptsBtn = document.getElementById('manage-prompts');
+        const clearChatBtn = document.getElementById('clear-chat');
+        const retryBtn = document.getElementById('retry');
+        const palette = document.getElementById('palette');
+        let prompts = JSON.parse(localStorage.getItem('prompts') || '{}');
+        let streaming = false;
+        let currentBotMsg = null;
+        let lastUserMessage = '';
+
+        function appendMessage(text, type) {
+            const msg = document.createElement('div');
+            msg.className = `message ${type}`;
+            msg.textContent = text;
+            chat.appendChild(msg);
+            chat.scrollTop = chat.scrollHeight;
+            if (type === 'bot') currentBotMsg = msg;
+        }
+
+        function clearChat() {
+            chat.innerHTML = '';
+            currentBotMsg = null;
+            lastUserMessage = '';
+        }
+
+        function savePrompts() {
+            localStorage.setItem('prompts', JSON.stringify(prompts));
+        }
+
+        function showPalette(query) {
+            palette.innerHTML = '';
+            const matches = Object.keys(prompts).filter(name => name.toLowerCase().includes(query.toLowerCase())).slice(0, 10);
+            if (matches.length === 0) {
+                palette.style.display = 'none';
+                return;
+            }
+            matches.forEach(name => {
+                const item = document.createElement('div');
+                item.className = 'palette-item';
+                item.textContent = name;
+                item.onclick = () => {
+                    input.value = prompts[name];
+                    palette.style.display = 'none';
+                    input.focus();
+                };
+                palette.appendChild(item);
+            });
+            palette.style.display = 'block';
+            const rect = input.getBoundingClientRect();
+            palette.style.left = rect.left + 'px';
+            palette.style.top = (rect.bottom + 5) + 'px';
+            palette.style.width = rect.width + 'px';
+        }
+
+        function handleCommand(cmd) {
+            if (cmd.startsWith('/save')) {
+                const parts = cmd.slice(6).trim().split(':');
+                if (parts.length < 2) {
+                    appendMessage('Usage: /save name: text', 'sys');
+                    return;
+                }
+                const name = parts[0].trim();
+                const text = parts.slice(1).join(':').trim();
+                if (!name || !text) return;
+                prompts[name] = text;
+                savePrompts();
+                appendMessage(`Saved prompt "${name}"`, 'sys');
+            } else if (cmd.startsWith('/delete')) {
+                const name = cmd.slice(8).trim();
+                if (prompts[name]) {
+                    delete prompts[name];
+                    savePrompts();
+                    appendMessage(`Deleted prompt "${name}"`, 'sys');
+                } else {
+                    appendMessage(`Prompt "${name}" not found`, 'sys');
+                }
+            } else if (cmd === '/list') {
+                const list = Object.keys(prompts).join(', ') || 'No prompts';
+                appendMessage(`Prompts: ${list}`, 'sys');
+            } else {
+                showPalette(cmd.slice(1));
+                return;
+            }
+            input.value = '';
+        }
+
+        async function sendMessage(userText = null, replace = false) {
+            const text = userText || input.value.trim();
+            if (!text) return;
+            if (!userText) {
+                input.value = '';
+                lastUserMessage = text;
+            }
+            palette.style.display = 'none';
+            if (text.startsWith('/')) {
+                handleCommand(text);
+                return;
+            }
+            if (!replace) {
+                appendMessage(`You: ${text}`, 'user');
+                appendMessage('Bot: ', 'bot');
+            }
+            streaming = true;
+            send.disabled = true;
+            retryBtn.disabled = true;
+            let fullContent = '';
+            try {
+                const response = await fetch('http://localhost:1234/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: 'local-model',
+                        messages: [{ role: 'user', content: text }],
+                        stream: true
+                    })
+                });
+                if (!response.ok) throw new Error('LM Studio not reachable');
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') break;
+                            try {
+                                const json = JSON.parse(data);
+                                const content = json.choices[0]?.delta?.content || '';
+                                if (content) {
+                                    fullContent += content;
+                                    if (currentBotMsg) currentBotMsg.textContent = 'Bot: ' + fullContent;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                }
+            } catch (e) {
+                if (currentBotMsg) currentBotMsg.textContent = 'Bot: Error: ' + e.message;
+            } finally {
+                streaming = false;
+                send.disabled = false;
+                retryBtn.disabled = false;
+            }
+        }
+
+        input.addEventListener('input', () => {
+            if (input.value.startsWith('/')) {
+                showPalette(input.value.slice(1));
+            } else {
+                palette.style.display = 'none';
+            }
+        });
+
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                if (input.value === '/' && palette.style.display !== 'none' && palette.children.length > 0) {
+                    palette.children[0].click();
+                    e.preventDefault();
+                } else {
+                    sendMessage();
+                }
+            }
+        });
+
+        savePromptBtn.addEventListener('click', () => {
+            const name = prompt('Enter prompt name:');
+            if (!name) return;
+            const text = prompt('Enter prompt text:');
+            if (!text) return;
+            prompts[name] = text;
+            savePrompts();
+            appendMessage(`Saved prompt "${name}"`, 'sys');
+        });
+
+        managePromptsBtn.addEventListener('click', () => {
+            const list = document.getElementById('prompt-list');
+            list.innerHTML = '';
+            Object.keys(prompts).forEach(name => {
+                const item = document.createElement('div');
+                item.className = 'd-flex justify-content-between align-items-center mb-2';
+                item.innerHTML = `
+                    <span>${name}: ${prompts[name].substring(0, 50)}...</span>
+                    <div>
+                        <button class="btn btn-sm btn-warning me-1" onclick="editPrompt('${name}')">Edit</button>
+                        <button class="btn btn-sm btn-danger" onclick="deletePrompt('${name}')">Delete</button>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+            new bootstrap.Modal(document.getElementById('manageModal')).show();
+        });
+
+        clearChatBtn.addEventListener('click', clearChat);
+
+        retryBtn.addEventListener('click', () => {
+            console.log('Retry clicked: lastUserMessage=', lastUserMessage, 'streaming=', streaming, 'currentBotMsg=', currentBotMsg);
+            if (lastUserMessage && !streaming) {
+                if (currentBotMsg) {
+                    console.log('Resetting bot message and retrying');
+                    currentBotMsg.textContent = 'Bot: ';
+                    sendMessage(lastUserMessage, true);
+                } else {
+                    console.log('No currentBotMsg to retry');
+                }
+            } else {
+                console.log('Cannot retry: no lastUserMessage or still streaming');
+            }
+        });
+
+        window.editPrompt = (name) => {
+            const newText = prompt('Edit prompt text:', prompts[name]);
+            if (newText !== null) {
+                prompts[name] = newText;
+                savePrompts();
+                appendMessage(`Edited prompt "${name}"`, 'sys');
+            }
+        };
+
+        window.deletePrompt = (name) => {
+            if (confirm(`Delete prompt "${name}"?`)) {
+                delete prompts[name];
+                savePrompts();
+                appendMessage(`Deleted prompt "${name}"`, 'sys');
+            }
+        };
+
+        send.addEventListener('click', () => sendMessage());
+
+        appendMessage('— Ready. Ensure LM Studio is running locally. —', 'sys');
+    </script>
+</body>
+</html>
